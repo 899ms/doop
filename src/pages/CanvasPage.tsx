@@ -60,6 +60,7 @@ import { Badge } from '../components/ui/badge'
 import { Input } from '../components/ui/input'
 import { Field } from '../components/ui/field'
 import { Avatar } from '../components/ui/avatar'
+import { PeerAvatars } from '../components/PeerAvatars'
 import { Checkbox, CheckboxCard } from '../components/ui/checkbox'
 import { Segmented, SegmentedItem } from '../components/ui/segmented'
 import { Toast, ToastAction } from '../components/ui/toast'
@@ -161,7 +162,10 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
          selected. Auto-repeat is ignored: a held key must not take the
          element and then, on the next repeat, the frame under it. */
       if ((e.key === 'Delete' || e.key === 'Backspace') && !e.repeat && deleteSelection()) e.preventDefault()
-      if (e.key === 'Escape') select(null)
+      if (e.key === 'Escape') {
+        select(null)
+        useStore.getState().setFollowing(null)
+      }
       if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key.toLowerCase() === 'z') {
         e.preventDefault()
         if (e.shiftKey) void redo()
@@ -345,17 +349,7 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
             >
               <Avatar name={me.name} kind="user" stacked />
             </Button>
-            {others.map((p) => (
-              <Avatar
-                key={p.clientId}
-                name={p.name}
-                color={p.color}
-                kind={p.kind}
-                status={p.status}
-                owner={p.owner}
-                stacked
-              />
-            ))}
+            <PeerAvatars others={others} />
           </div>
           <BarDivider />
           <Tooltip label={selectedId ? 'Present this frame' : 'Select a frame to present'} side="bottom">
@@ -395,17 +389,7 @@ export function CanvasPage({ canvasId }: { canvasId: string }) {
             title={others.map((p) => p.name).join(', ') || 'Just you here'}
           >
             <Avatar name={me.name} kind="user" stacked />
-            {others.map((p) => (
-              <Avatar
-                key={p.clientId}
-                name={p.name}
-                color={p.color}
-                kind={p.kind}
-                status={p.status}
-                owner={p.owner}
-                stacked
-              />
-            ))}
+            <PeerAvatars others={others} />
           </div>
           <Button
             variant="primary"
