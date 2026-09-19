@@ -1,3 +1,10 @@
+import { planRow, planMark, planPill, planAsCode, actionsRow } from './ui/model-plan'
+import { AgentIcon } from './AgentIcon'
+import { CLAUDE_MODELS } from '../../shared/localAgent'
+import { LocalClaudeRow } from './LocalClaude'
+import { authClient } from '../lib/auth'
+import { selectLocalAgent, useLocalAgent } from '../lib/localAgent'
+import { isDesktopShell } from '../lib/shell'
 import { useCallback, useEffect, useState } from 'react'
 import { api } from '../lib/api'
 import type { DeviceFlow, ModelAccountStatus } from '../lib/api'
@@ -71,29 +78,6 @@ function planName(plan: string): string {
   )
 }
 
-/* provider rows: one per model plan, divided rather than boxed — the set-card
-   is the container. The connected one carries a green left-edge tint. */
-const planRow = (live: boolean) =>
-  cn(
-    'flex gap-[14px] border-b border-line-soft px-[22px] py-[18px] last:border-b-0 max-md:gap-3 max-md:px-4 max-md:py-[17px]',
-    live && 'bg-[linear-gradient(90deg,rgba(63,156,82,0.05),transparent_40%)]',
-  )
-const planMark = (live: boolean) =>
-  cn(
-    'grid h-9 w-9 flex-none place-items-center rounded-[11px] border border-line bg-paper-deep text-ink',
-    live && 'border-black bg-black text-white',
-  )
-const planPill = (on: boolean) =>
-  cn(
-    'rounded-full bg-paper-deep px-[9px] py-[3px] text-[11.5px] font-bold text-ink-faint',
-    on && 'bg-[rgba(30,122,76,0.12)] text-[#1a6b43]',
-  )
-/* the model tiers as chips — the base .chip recipe reshaped into the picker */
-const planAsCode =
-  'inline-block rounded-[7px] bg-paper-deep px-[9px] py-[3px] font-mono text-[12.5px] leading-[1.5] text-ink [overflow-wrap:anywhere]'
-/* chips left, the row's action right, sharing one line */
-const actionsRow =
-  'mt-[18px] flex flex-wrap items-center justify-between gap-5 max-md:flex-col max-md:items-stretch max-md:gap-[10px]'
 const planFlow = 'mt-[14px]'
 const maSteps =
   'mb-3 ml-[18px] mt-[10px] text-[13px] leading-[1.7] text-ink-soft [&_code]:font-mono [&_code]:text-[12px]'
@@ -107,7 +91,15 @@ const maInput = 'rounded-[10px] border-ink px-3 py-[10px] font-mono focus:ring-0
 const rowBtn = 'max-md:justify-center'
 
 export function ModelAccountPanel({ onChange }: { onChange?: () => void }) {
+  const desktop = isDesktopShell()
   const { account, refresh, set } = useModelAccount()
+  const { data: session } = authClient.useSession()
+  const local = useLocalAgent((s) => s.preference)
+  const userId = session?.user.id
+  const localModel = local?.model ?? 'default'
+  const selectServer = useCallback(async () => {
+    if (userId) await selectLocalAgent(userId, { enabled: false, model: localModel })
+  }, [userId, localModel])
   const [authUrl, setAuthUrl] = useState('')
   /* true while the server is listening on the loopback callback port for us —
      the user approves in the other tab and this one just flips */
@@ -115,9 +107,10 @@ export function ModelAccountPanel({ onChange }: { onChange?: () => void }) {
   const [device, setDevice] = useState<DeviceFlow | null>(null)
   const [redirect, setRedirect] = useState('')
   const [apiKey, setApiKey] = useState('')
-  const [showKey, setShowKey] = useState(false)
+  const [showKey, setShowKey] = useState<false | 'openai-key' | 'anthropic-key'>(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+  const [switchFailed, setSwitchFailed] = useState(false)
 
   const settle = useCallback(
     (next: ModelAccountStatus) => {
@@ -127,7 +120,9 @@ export function ModelAccountPanel({ onChange }: { onChange?: () => void }) {
       setDevice(null)
       setRedirect('')
       setApiKey('')
+      setShowKey(false)
       setError('')
+      setSwitchFailed(false)
       onChange?.()
       /* every allowance meter and wall on screen re-reads, not just this pane */
       useStore.getState().allowanceChanged()
@@ -135,23 +130,45 @@ export function ModelAccountPanel({ onChange }: { onChange?: () => void }) {
     [set, onChange],
   )
 
+  const activateChatgpt = useCallback(
+    async (next: ModelAccountStatus) => {
+      // Authorization is complete even if selecting the provider subsequently fails.
+      // Keep the connected account visible so retry never exchanges the OAuth code again.
+      settle(next)
+      setBusy(true)
+      try {
+        await selectServer()
+      } catch {
+        setSwitchFailed(true)
+        setError('ChatGPT connected, but switching providers failed. Retry the switch without signing in again.')
+      } finally {
+        setBusy(false)
+      }
+    },
+    [settle, selectServer],
+  )
+
   /* poll only while a sign-in is actually in flight */
   const pendingDevice = device?.status === 'pending'
   useEffect(() => {
     if (!waiting && !pendingDevice) return
+    let cancelled = false
     const id = window.setInterval(() => {
-      api.modelAccount().then(
-        (next) => {
-          if (next.connected) settle(next)
-        },
-        () => {},
-      )
+      api
+        .modelAccount()
+        .then(async (next) => {
+          // An existing API-key account is not evidence that OAuth succeeded.
+          if (cancelled || !next.connected || next.kind !== 'chatgpt') return
+          cancelled = true
+          await activateChatgpt(next)
+        })
+        .catch(() => {})
       /* the device flow can also fail server-side (expired, refused) — that
          status is the only place the user would ever learn why */
       if (pendingDevice) {
         api.deviceAuthStatus().then(
           (flow) => {
-            if ('userCode' in flow && flow.status === 'error') {
+            if (!cancelled && 'userCode' in flow && flow.status === 'error') {
               setDevice(null)
               setError(flow.error || 'That sign-in did not complete')
             }
@@ -160,8 +177,11 @@ export function ModelAccountPanel({ onChange }: { onChange?: () => void }) {
         )
       }
     }, 1500)
-    return () => window.clearInterval(id)
-  }, [waiting, pendingDevice, settle])
+    return () => {
+      cancelled = true
+      window.clearInterval(id)
+    }
+  }, [waiting, pendingDevice, activateChatgpt])
 
   const fail = (e: unknown) => {
     const body = (e as { body?: { error?: string } })?.body
@@ -218,7 +238,8 @@ export function ModelAccountPanel({ onChange }: { onChange?: () => void }) {
     setBusy(true)
     setError('')
     try {
-      settle(await api.connectChatgpt(redirect))
+      const next = await api.connectChatgpt(redirect)
+      await activateChatgpt(next)
       posthog.capture('chatgpt_connected')
     } catch (e) {
       fail(e)
@@ -231,8 +252,10 @@ export function ModelAccountPanel({ onChange }: { onChange?: () => void }) {
     setBusy(true)
     setError('')
     try {
-      settle(await api.connectOpenAiKey(apiKey))
-      posthog.capture('model_account_connected', { kind: 'openai-key' })
+      const next = await (showKey === 'anthropic-key' ? api.connectAnthropicKey(apiKey) : api.connectOpenAiKey(apiKey))
+      if (account?.kind !== showKey) await selectServer()
+      settle(next)
+      posthog.capture('model_account_connected', { kind: showKey || 'openai-key' })
     } catch (e) {
       fail(e)
     } finally {
@@ -273,39 +296,44 @@ export function ModelAccountPanel({ onChange }: { onChange?: () => void }) {
   const chosen = options.find((m) => m.id === account.model)
   const onChatgpt = account.connected && account.kind === 'chatgpt'
   const onKey = account.connected && account.kind === 'openai-key'
+  const onClaudeKey = account.connected && account.kind === 'anthropic-key'
   /* only one account is stored per user, so connecting one replaces the other */
   const replaces = account.connected
 
   /* On the connected row the chips ARE the model picker; on any other row they
      only advertise what that plan can run, so they stay inert. */
-  const modelChips = (live: boolean) =>
-    live ? (
+  const modelChips = (live: boolean, claude = false) => {
+    const models = claude ? CLAUDE_MODELS : options
+    return live ? (
       <ToggleChipGroup aria-label="Model" value={account.model ?? ''} onValueChange={pickModel} disabled={busy}>
-        {options.map((m) => (
+        {models.map((m) => (
           <ToggleChipItem key={m.id} value={m.id} title={m.blurb}>
             {m.id === account.model && <Tick />}
             {m.name}
           </ToggleChipItem>
         ))}
         {/* a server override outside the known tiers still has to be visible */}
-        {account.model && !chosen && <ToggleChip state="on">{account.model}</ToggleChip>}
+        {account.model && !models.some((m) => m.id === account.model) && (
+          <ToggleChip state="on">{account.model}</ToggleChip>
+        )}
       </ToggleChipGroup>
     ) : (
       /* inert on a row that is not the connected one — a capability list, not a control */
       <div className="flex flex-wrap gap-[9px]">
-        {options.map((m) => (
+        {models.map((m) => (
           <ToggleChip key={m.id} state="idle">
             {m.name}
           </ToggleChip>
         ))}
       </div>
     )
+  }
 
   return (
     <div className="flex flex-col">
       {account.chatgptEnabled !== false && (
-        <section className={planRow(onChatgpt)}>
-          <span className={planMark(onChatgpt)}>
+        <section className={planRow(onChatgpt && !local?.enabled)}>
+          <span className={planMark(onChatgpt && !local?.enabled)}>
             <OpenAiMark />
           </span>
           <div className="min-w-0 flex-1">
@@ -313,7 +341,9 @@ export function ModelAccountPanel({ onChange }: { onChange?: () => void }) {
               <h3 className="font-display text-[18px] font-extrabold normal-case tracking-[-0.02em] text-ink max-md:text-[17px]">
                 Codex Plan
               </h3>
-              <span className={planPill(onChatgpt)}>{onChatgpt ? 'Connected' : 'Not connected'}</span>
+              <span className={planPill(onChatgpt)}>
+                {onChatgpt ? (local?.enabled ? 'Connected' : 'Active · Connected') : 'Not connected'}
+              </span>
             </div>
             <p className="mt-1.5 text-[14px] leading-[1.55] text-ink-soft max-md:text-[13.5px]">
               Route OpenAI models through your ChatGPT subscription
@@ -339,9 +369,16 @@ export function ModelAccountPanel({ onChange }: { onChange?: () => void }) {
               <>
                 <div className={actionsRow}>
                   {modelChips(true)}
-                  <Button variant="danger" className={rowBtn} onClick={remove} disabled={busy}>
-                    Disconnect
-                  </Button>
+                  <div className="flex flex-wrap gap-2 max-md:[&>button]:flex-1">
+                    {(local?.enabled || switchFailed) && (
+                      <Button disabled={busy} onClick={() => activateChatgpt(account)}>
+                        {switchFailed ? 'Retry switch' : 'Use instead'}
+                      </Button>
+                    )}
+                    <Button variant="danger" className={rowBtn} onClick={remove} disabled={busy}>
+                      Disconnect
+                    </Button>
+                  </div>
                 </div>
                 {chosen && <p className="mt-[10px] text-[13px] text-ink-faint">{chosen.blurb}</p>}
               </>
@@ -442,8 +479,8 @@ export function ModelAccountPanel({ onChange }: { onChange?: () => void }) {
         </section>
       )}
 
-      <section className={planRow(onKey)}>
-        <span className={planMark(onKey)}>
+      <section className={planRow(onKey && !local?.enabled)}>
+        <span className={planMark(onKey && !local?.enabled)}>
           <OpenAiMark />
         </span>
         <div className="min-w-0 flex-1">
@@ -451,23 +488,50 @@ export function ModelAccountPanel({ onChange }: { onChange?: () => void }) {
             <h3 className="font-display text-[18px] font-extrabold normal-case tracking-[-0.02em] text-ink max-md:text-[17px]">
               OpenAI API key
             </h3>
-            <span className={planPill(onKey)}>{onKey ? 'Connected' : 'Not connected'}</span>
+            <span className={planPill(onKey)}>
+              {onKey && showKey !== 'openai-key'
+                ? local?.enabled
+                  ? 'Connected'
+                  : 'Active · Connected'
+                : 'Not connected'}
+            </span>
           </div>
           <p className="mt-1.5 text-[14px] leading-[1.55] text-ink-soft max-md:text-[13.5px]">
             Pay per token on your own OpenAI account — no ChatGPT subscription involved
           </p>
 
-          {onKey ? (
+          {onKey && showKey !== 'openai-key' ? (
             <>
               <div className={actionsRow}>
                 {modelChips(true)}
-                <Button variant="danger" className={rowBtn} onClick={remove} disabled={busy}>
-                  Disconnect
-                </Button>
+                <div className="flex flex-wrap gap-2 max-md:[&>button]:flex-1">
+                  <Button
+                    disabled={busy}
+                    onClick={() => {
+                      setApiKey('')
+                      setShowKey('openai-key')
+                    }}
+                  >
+                    Rotate key
+                  </Button>
+                  {local?.enabled && (
+                    <Button
+                      disabled={busy}
+                      onClick={() => {
+                        selectServer().catch(fail)
+                      }}
+                    >
+                      Use instead
+                    </Button>
+                  )}
+                  <Button variant="danger" className={rowBtn} onClick={remove} disabled={busy}>
+                    Disconnect
+                  </Button>
+                </div>
               </div>
               {chosen && <p className="mt-[10px] text-[13px] text-ink-faint">{chosen.blurb}</p>}
             </>
-          ) : showKey ? (
+          ) : showKey === 'openai-key' ? (
             <div className={planFlow}>
               <p className="mb-3 mt-2 text-[13px] leading-[1.55] text-ink-soft">
                 The key is stored on the server and never shown again.
@@ -483,7 +547,7 @@ export function ModelAccountPanel({ onChange }: { onChange?: () => void }) {
               />
               <div className={maActions}>
                 <Button variant="primary" className={rowBtn} onClick={saveKey} disabled={busy || !apiKey.trim()}>
-                  {busy ? 'Saving…' : 'Save key'}
+                  {busy ? 'Saving…' : onKey ? 'Rotate key' : 'Save key'}
                 </Button>
                 <Button variant="ghost" className={rowBtn} onClick={() => setShowKey(false)}>
                   Cancel
@@ -493,7 +557,14 @@ export function ModelAccountPanel({ onChange }: { onChange?: () => void }) {
           ) : (
             <div className={actionsRow}>
               {modelChips(false)}
-              <Button className={rowBtn} onClick={() => setShowKey(true)} disabled={busy}>
+              <Button
+                className={rowBtn}
+                onClick={() => {
+                  setApiKey('')
+                  setShowKey('openai-key')
+                }}
+                disabled={busy}
+              >
                 {replaces ? 'Use instead' : 'Connect'}
               </Button>
             </div>
@@ -501,6 +572,104 @@ export function ModelAccountPanel({ onChange }: { onChange?: () => void }) {
         </div>
       </section>
 
+      {desktop && <LocalClaudeRow />}
+      <section className={planRow(onClaudeKey && !local?.enabled)}>
+        <span className={planMark(onClaudeKey && !local?.enabled)}>
+          <AgentIcon name="claude" size={20} />
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-[10px] max-md:flex-wrap max-md:items-start max-md:gap-x-[9px] max-md:gap-y-[6px]">
+            <h3 className="font-display text-[18px] font-extrabold normal-case tracking-[-0.02em] text-ink max-md:text-[17px]">
+              Claude API key
+            </h3>
+            <span className={planPill(onClaudeKey)}>
+              {onClaudeKey && showKey !== 'anthropic-key'
+                ? local?.enabled
+                  ? 'Connected'
+                  : 'Active · Connected'
+                : 'Not connected'}
+            </span>
+          </div>
+          <p className="mt-1.5 text-[14px] leading-[1.55] text-ink-soft max-md:text-[13.5px]">
+            Pay per token on your Anthropic account. Runs on Doop’s server.
+          </p>
+
+          {onClaudeKey && showKey !== 'anthropic-key' ? (
+            <>
+              <div className={actionsRow}>
+                {modelChips(true, true)}
+                <div className="flex flex-wrap gap-2 max-md:[&>button]:flex-1">
+                  <Button
+                    disabled={busy}
+                    onClick={() => {
+                      setApiKey('')
+                      setShowKey('anthropic-key')
+                    }}
+                  >
+                    Rotate key
+                  </Button>
+                  {local?.enabled && (
+                    <Button
+                      disabled={busy}
+                      onClick={() => {
+                        selectServer().catch(fail)
+                      }}
+                    >
+                      Use instead
+                    </Button>
+                  )}
+                  <Button variant="danger" className={rowBtn} onClick={remove} disabled={busy}>
+                    Disconnect
+                  </Button>
+                </div>
+              </div>
+              <p className="mt-[10px] text-[13px] text-ink-faint">
+                {CLAUDE_MODELS.find((model) => model.id === account.model)?.blurb}
+              </p>
+            </>
+          ) : showKey === 'anthropic-key' ? (
+            <div className={planFlow}>
+              <p className="mb-3 mt-2 text-[13px] leading-[1.55] text-ink-soft">
+                The key is stored on the server and never shown again.
+              </p>
+              <Input
+                className={maInput}
+                value={apiKey}
+                onChange={(e) => setApiKey(e.target.value)}
+                placeholder="sk-ant-…"
+                type="password"
+                autoFocus
+                spellCheck={false}
+              />
+              <div className={maActions}>
+                <Button variant="primary" className={rowBtn} onClick={saveKey} disabled={busy || !apiKey.trim()}>
+                  {busy ? 'Saving…' : onClaudeKey ? 'Rotate key' : 'Save key'}
+                </Button>
+                <Button variant="ghost" className={rowBtn} onClick={() => setShowKey(false)}>
+                  Cancel
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <div className={actionsRow}>
+              {modelChips(false, true)}
+              <Button
+                className={rowBtn}
+                onClick={() => {
+                  setApiKey('')
+                  setShowKey('anthropic-key')
+                }}
+                disabled={busy}
+              >
+                {replaces ? 'Use instead' : 'Connect'}
+              </Button>
+            </div>
+          )}
+        </div>
+      </section>
+
+      {/* the browser cannot run the local CLI, so the plan closes the list as a pointer to the desktop app */}
+      {!desktop && <LocalClaudeRow />}
       {error && <p className="mt-[10px] text-[12.5px] text-accent-ink">{error}</p>}
     </div>
   )

@@ -1,7 +1,10 @@
+import { getLocalAgentPreference } from './localAgentPreferences.ts'
+import { localAgentRuns, type LocalHarnessRequest } from './localAgentRuns.ts'
+import type { LocalAgentResult } from '../shared/localAgent.ts'
 import Anthropic from '@anthropic-ai/sdk'
-import { getAccount, withFreshToken } from './modelAccounts.ts'
+import { getAccount, withFreshToken, accountModelFor } from './modelAccounts.ts'
 import type { AccountKind, ModelAccount } from './modelAccounts.ts'
-import { modelFor, ModelAuthError, runAzureTurn, runOpenAiTurn } from './openaiAgent.ts'
+import { ModelAuthError, runAzureTurn, runOpenAiTurn } from './openaiAgent.ts'
 import type { StopReason, TurnBlock } from './openaiAgent.ts'
 
 /**
@@ -23,7 +26,7 @@ import type { StopReason, TurnBlock } from './openaiAgent.ts'
  */
 
 export type ServerProvider = 'anthropic' | 'azure'
-export type Provider = ServerProvider | AccountKind
+export type Provider = ServerProvider | AccountKind | 'claude-local'
 
 export interface AgentTurnRequest {
   /** ordered system blocks; `cache` marks an Anthropic cache breakpoint */
@@ -44,10 +47,12 @@ export interface AgentModel {
   label: string
   /** the user whose account pays, when it isn't the server's key */
   userId?: string
+  runHarness?: (req: LocalHarnessRequest) => Promise<LocalAgentResult>
   run(req: AgentTurnRequest): Promise<AgentTurnResult>
 }
 
 export { ModelAuthError }
+export class ModelConfigurationError extends ModelAuthError {}
 
 /* ---------------------------------------------------------------- */
 /* the server tier: pays for everyone's free tasks                  */
@@ -186,6 +191,7 @@ function warnOnce(message: string) {
 const BYO_LABELS: Record<AccountKind, string> = {
   chatgpt: 'ChatGPT',
   'openai-key': 'OpenAI',
+  'anthropic-key': 'Claude API',
 }
 
 /* the OpenAI-shaped transports take one system string; cache breakpoints are
@@ -195,9 +201,38 @@ function joinSystem(req: AgentTurnRequest): string {
 }
 
 function byoModel(account: ModelAccount): AgentModel {
+  if (account.kind === 'anthropic-key') {
+    if (!account.apiKey) throw new ModelAuthError('Reconnect your Claude API key in Settings.')
+    const client = new Anthropic({ apiKey: account.apiKey })
+    const model = accountModelFor(account)
+    return {
+      provider: account.kind,
+      label: `Claude API (${model})`,
+      userId: account.userId,
+      async run(req) {
+        try {
+          return await runAnthropicTurn(client, model, req)
+        } catch (error) {
+          if (
+            error instanceof Anthropic.APIError &&
+            (error.status === 400 || error.status === 404) &&
+            /anthropic-workspace-id|workspace/i.test(error.message)
+          ) {
+            throw new ModelConfigurationError(
+              'Create an Anthropic API key scoped to one workspace, then use Rotate key in Settings → Claude API key and retry.',
+            )
+          }
+          if (error instanceof Anthropic.APIError && (error.status === 401 || error.status === 403)) {
+            throw new ModelAuthError('Anthropic rejected your API key. Reconnect it in Settings.')
+          }
+          throw error
+        }
+      },
+    }
+  }
   return {
     provider: account.kind,
-    label: `${BYO_LABELS[account.kind]} (${modelFor(account)})`,
+    label: `${BYO_LABELS[account.kind]} (${accountModelFor(account)})`,
     userId: account.userId,
     async run(req) {
       /* refreshed per turn, not per run: a long design run outlives an
@@ -224,6 +259,23 @@ function byoModel(account: ModelAccount): AgentModel {
  * connecting stops costing us anything from that moment on.
  */
 export async function pickModel(payerId?: string): Promise<AgentModel | null> {
+  if (payerId) {
+    const local = await getLocalAgentPreference(payerId)
+    if (local.enabled) {
+      if (!localAgentRuns.online(payerId)) return null
+      return {
+        provider: 'claude-local',
+        label: `Claude CLI (${local.model})`,
+        userId: payerId,
+        runHarness: (req) => localAgentRuns.start(payerId, local.model, req),
+        run: () =>
+          Promise.reject(
+            new Error('Repository imports require a server provider. Select your connected account in Settings.'),
+          ),
+      }
+    }
+  }
+
   const account = payerId
     ? await getAccount(payerId).catch((err) => {
         console.error('[doop-agent] could not read the connected model account', err)

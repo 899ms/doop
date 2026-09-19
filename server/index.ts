@@ -1,3 +1,4 @@
+import { localAgentRouter, handleLocalAgentMcp } from './localAgent.ts'
 import http from 'node:http'
 import { createHash } from 'node:crypto'
 import { readFileSync } from 'node:fs'
@@ -39,6 +40,7 @@ import * as githubApp from './githubApp.ts'
 import { seed } from './seed.ts'
 import * as allowance from './allowance.ts'
 import * as modelAccounts from './modelAccounts.ts'
+import { getLocalAgentPreference, saveLocalAgentPreference } from './localAgentPreferences.ts'
 import { serverTierInfo } from './agentModel.ts'
 import { serverImageGenEnabled } from './imageGen.ts'
 import { AGENT_MODELS } from './openaiAgent.ts'
@@ -479,6 +481,9 @@ app.post('/stripe/webhook', express.raw({ type: '*/*', limit: '1mb' }), (req, re
 })
 
 app.use(express.json({ limit: '10mb' }))
+app.all('/local-agent/mcp/:id', (req, res, next) => {
+  handleLocalAgentMcp(req, res).catch(next)
+})
 
 /* Public: does an account exist for this email? Drives the login page's
    "no account found — sign up instead" prompt. Existence is already
@@ -605,6 +610,7 @@ function requireFrame(req: express.Request, res: express.Response, frameId: stri
   return frame
 }
 
+app.use('/api/local-agent', localAgentRouter)
 app.use('/api/admin', adminRouter)
 app.use('/api/community', communityRouter)
 app.use('/api/automations', automationsRouter)
@@ -705,6 +711,20 @@ app.delete('/api/model-account/chatgpt/device', (req, res) => {
 app.post('/api/model-account/openai-key', async (req, res) => {
   try {
     res.json(accountView(await modelAccounts.connectApiKey(req.user!.id, String(req.body?.apiKey ?? ''))))
+  } catch (e) {
+    res.status(400).json({ error: e instanceof Error ? e.message : 'could not save that API key' })
+  }
+})
+
+app.post('/api/model-account/anthropic-key', async (req, res) => {
+  try {
+    const previous = await modelAccounts.getAccount(req.user!.id)
+    const status = await modelAccounts.connectAnthropicKey(req.user!.id, String(req.body?.apiKey ?? ''))
+    if (previous?.kind !== 'anthropic-key') {
+      const preference = await getLocalAgentPreference(req.user!.id)
+      await saveLocalAgentPreference(req.user!.id, { ...preference, enabled: false })
+    }
+    res.json(accountView(status))
   } catch (e) {
     res.status(400).json({ error: e instanceof Error ? e.message : 'could not save that API key' })
   }
